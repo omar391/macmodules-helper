@@ -10,7 +10,7 @@ The bridge authenticates the paired app's signed identity, reports available cap
 
 The bridge is installed separately from the Mac App Store app and runs as a root-owned LaunchDaemon. Its package is signed and notarized in release automation. Installation, pairing, and package authorization require explicit macOS administrator approval. Before the app can pair, an administrator grants one pairing for the exact signing team and bundle identifier with `sudo /usr/local/libexec/scriptd-bridge authorize-pairing TEAM_IDENTIFIER BUNDLE_IDENTIFIER`. Pairing does not authorize package installation.
 
-The Mac App Store edition cannot connect to or execute operations through this bridge. Installing Bridge does not enable privileged features in that edition. Bridge setup is for the direct-download edition; the Store app remains self-contained and does not download or install Bridge, run its installer, request root privileges, or execute package operations. Direct-download users can get the signed Bridge from [GitHub Releases](https://github.com/omar391/scriptd/releases/latest).
+The Mac App Store edition cannot connect to or execute operations through this bridge. Installing Bridge does not enable privileged features in that edition. Bridge setup is for the direct-download edition; the Store app remains self-contained and does not download or install Bridge, run its installer, request root privileges, or execute package operations. Direct-download users can get the signed Bridge from [GitHub Releases](https://github.com/omar391/macmodules-helper/releases/latest).
 
 ### Install Scriptd Bridge
 

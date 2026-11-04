@@ -30,6 +30,31 @@ const MAX_RECEIPTS: usize = 4096;
 const MAX_RECEIPT_MESSAGE_BYTES: usize = 4096;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const DIRECT_APP_BUNDLE_IDENTIFIER: &str = "com.astronlab.scriptd";
+const DIRECT_MODULE_BUNDLE_IDENTIFIERS: &[&str] = &[
+    "com.astronlab.macmodules.mbrew",
+    "com.astronlab.macmodules.mcpu",
+    "com.astronlab.macmodules.mwifi",
+    "com.astronlab.macmodules.miwatch",
+];
+
+fn is_direct_distribution_identity(bundle_identifier: &str) -> bool {
+    bundle_identifier == DIRECT_APP_BUNDLE_IDENTIFIER
+        || DIRECT_MODULE_BUNDLE_IDENTIFIERS.contains(&bundle_identifier)
+}
+
+fn allows_wifi_capability(bundle_identifier: &str) -> bool {
+    matches!(
+        bundle_identifier,
+        "com.astronlab.scriptd" | "com.astronlab.macmodules.mwifi"
+    )
+}
+
+fn allows_installer_capability(bundle_identifier: &str) -> bool {
+    matches!(
+        bundle_identifier,
+        "com.astronlab.scriptd" | "com.astronlab.macmodules.mbrew"
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,8 +213,10 @@ impl State {
         mut persist: impl FnMut(&State) -> Result<()>,
     ) -> Result<()> {
         validate_identity(&grant.app_identity)?;
-        if grant.app_identity.bundle_identifier != DIRECT_APP_BUNDLE_IDENTIFIER {
-            bail!("package approval is available only to the direct-download app edition");
+        if !allows_installer_capability(&grant.app_identity.bundle_identifier) {
+            bail!(
+                "package approval is available only to the all-in-one or Brew Manager direct app"
+            );
         }
         validate_team_identifier(&grant.publisher_team_identifier)?;
         validate_package_identifier(&grant.package_identifier)?;
@@ -243,6 +270,9 @@ impl State {
         mut persist: impl FnMut(&State) -> Result<()>,
     ) -> Result<PairingReceipt> {
         validate_identity(identity)?;
+        if !is_direct_distribution_identity(&identity.bundle_identifier) {
+            bail!("only direct-distribution MacModules identities may pair with the helper");
+        }
         if !matches!(
             request.protocol_version,
             PROTOCOL_VERSION | INSTALLER_PROTOCOL_VERSION
@@ -307,6 +337,9 @@ impl State {
         mut persist: impl FnMut(&State) -> Result<()>,
     ) -> Result<()> {
         validate_identity(identity)?;
+        if !is_direct_distribution_identity(&identity.bundle_identifier) {
+            bail!("only direct-distribution MacModules identities may request pairing approval");
+        }
         if self
             .pairings
             .get(&identity.bundle_identifier)
@@ -354,6 +387,9 @@ impl State {
             Operation::InstallApprovedPackage {
                 package_identifier, ..
             } => {
+                if !allows_installer_capability(&identity.bundle_identifier) {
+                    bail!("this signed MacModules identity cannot install packages");
+                }
                 self.installer_grant(identity, package_identifier)?;
                 self.installer_grants
                     .values()
@@ -361,7 +397,12 @@ impl State {
                     .cloned()
                     .collect::<Vec<_>>()
             }
-            Operation::SetWifiNetwork { .. } => Vec::new(),
+            Operation::SetWifiNetwork { .. } => {
+                if !allows_wifi_capability(&identity.bundle_identifier) {
+                    bail!("this signed MacModules identity cannot change Wi-Fi networks");
+                }
+                Vec::new()
+            }
         };
         let id = request.operation_id.as_str().to_string();
         if let Some(existing) = self.operations.get(&id) {
@@ -576,17 +617,22 @@ fn handle_inner(
             Some(
                 serde_json::to_value(CapabilityReport {
                     protocol_version: request.v,
-                    capabilities: if request.v == INSTALLER_PROTOCOL_VERSION {
-                        let mut capabilities = vec![Capability::WifiNetworkChange];
-                        if identity.as_ref().is_some_and(|identity| {
-                            identity.bundle_identifier == DIRECT_APP_BUNDLE_IDENTIFIER
-                        }) {
-                            capabilities.push(Capability::InstallerPackageV1);
-                        }
-                        capabilities
-                    } else {
-                        vec![Capability::WifiNetworkChange]
-                    },
+                    capabilities: identity
+                        .as_ref()
+                        .map(|identity| {
+                            let bundle_identifier = identity.bundle_identifier.as_str();
+                            let mut capabilities = Vec::new();
+                            if allows_wifi_capability(bundle_identifier) {
+                                capabilities.push(Capability::WifiNetworkChange);
+                            }
+                            if request.v == INSTALLER_PROTOCOL_VERSION
+                                && allows_installer_capability(bundle_identifier)
+                            {
+                                capabilities.push(Capability::InstallerPackageV1);
+                            }
+                            capabilities
+                        })
+                        .unwrap_or_default(),
                 })
                 .unwrap_or(serde_json::Value::Null),
             ),
@@ -770,7 +816,7 @@ fn handle_inner(
                     None,
                 );
             };
-            if identity.bundle_identifier != DIRECT_APP_BUNDLE_IDENTIFIER {
+            if !allows_installer_capability(&identity.bundle_identifier) {
                 return respond(
                     &request.id,
                     false,
@@ -1882,7 +1928,7 @@ mod tests {
     fn identity() -> Identity {
         Identity {
             team_identifier: "TEAM123456".to_string(),
-            bundle_identifier: "com.example.scriptd".to_string(),
+            bundle_identifier: DIRECT_APP_BUNDLE_IDENTIFIER.to_string(),
         }
     }
 
@@ -2856,7 +2902,7 @@ mod tests {
                 module: None,
                 yaml: None,
             },
-            None,
+            Some(identity()),
             false,
             &mut State::default(),
             Path::new("unused"),
@@ -2865,6 +2911,86 @@ mod tests {
         let report: CapabilityReport =
             serde_json::from_value(response.snapshot.unwrap()).expect("decode capability report");
         assert_eq!(report.capabilities, vec![Capability::WifiNetworkChange]);
+    }
+
+    #[test]
+    fn direct_cpu_identity_cannot_submit_wifi_operations_even_after_pairing() {
+        let identity = Identity {
+            team_identifier: "TEAM123456".into(),
+            bundle_identifier: "com.astronlab.macmodules.mcpu".into(),
+        };
+        let mut state = State::default();
+        state
+            .authorize_pairing_with(&identity, |_| Ok(()))
+            .expect("approve direct module identity");
+        state
+            .pair_with(
+                &identity,
+                PairingRequest {
+                    bundle_identifier: identity.bundle_identifier.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+                |_| Ok(()),
+            )
+            .expect("pair direct module identity");
+        let request = OperationRequest {
+            protocol_version: PROTOCOL_VERSION,
+            operation_id: scriptd_bridge_protocol::OperationId::new("cpu-wifi-test")
+                .expect("valid operation ID"),
+            operation: Operation::SetWifiNetwork {
+                ssid: "Test Wi-Fi".into(),
+            },
+        };
+        assert!(state
+            .submit_with(&identity, request, |_| Ok(()), |_, _| Ok(()))
+            .is_err());
+    }
+
+    #[test]
+    fn store_module_identity_cannot_obtain_helper_pairing_or_privileged_grants() {
+        let identity = Identity {
+            team_identifier: "TEAM123456".into(),
+            bundle_identifier: "com.astronlab.macmodules.mbrew.store".into(),
+        };
+        let mut state = State::default();
+        assert!(state.authorize_pairing_with(&identity, |_| Ok(())).is_err());
+        assert!(state
+            .pair_with(
+                &identity,
+                PairingRequest {
+                    bundle_identifier: identity.bundle_identifier.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+                |_| Ok(()),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn helper_capabilities_are_bound_to_exact_direct_module_identities() {
+        for id in [
+            "com.astronlab.macmodules.mbrew",
+            "com.astronlab.macmodules.mcpu",
+            "com.astronlab.macmodules.mwifi",
+            "com.astronlab.macmodules.miwatch",
+        ] {
+            assert!(is_direct_distribution_identity(id), "direct identity {id}");
+            assert!(!is_direct_distribution_identity(&format!("{id}.store")));
+        }
+        assert!(allows_installer_capability(
+            "com.astronlab.macmodules.mbrew"
+        ));
+        assert!(!allows_installer_capability(
+            "com.astronlab.macmodules.mwifi"
+        ));
+        assert!(!allows_installer_capability(
+            "com.astronlab.macmodules.mbrew.store"
+        ));
+        assert!(allows_wifi_capability("com.astronlab.macmodules.mwifi"));
+        assert!(!allows_wifi_capability("com.astronlab.macmodules.mcpu"));
+        assert!(!allows_wifi_capability(
+            "com.astronlab.macmodules.mwifi.store"
+        ));
     }
 
     #[test]

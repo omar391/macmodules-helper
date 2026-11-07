@@ -363,15 +363,6 @@ impl State {
         Ok(())
     }
 
-    fn submit(
-        &mut self,
-        identity: &Identity,
-        request: OperationRequest,
-        path: &Path,
-    ) -> Result<OperationReceipt> {
-        self.submit_with(identity, request, |state| state.save(path), execute)
-    }
-
     fn submit_with(
         &mut self,
         identity: &Identity,
@@ -585,19 +576,75 @@ fn handle(
     state: &mut State,
     state_path: &Path,
 ) -> Response {
-    let protocol_version = request.v;
-    let mut response = handle_inner(request, identity, admin_authorized, state, state_path);
-    response.v = protocol_version;
-    response
+    handle_with_executor(
+        request,
+        identity,
+        admin_authorized,
+        state,
+        state_path,
+        execute,
+    )
 }
 
-fn handle_inner(
+fn handle_with_executor(
     request: Request,
     identity: Option<Identity>,
     admin_authorized: bool,
     state: &mut State,
     state_path: &Path,
+    execute_operation: impl FnOnce(&Operation, &[InstallerGrant]) -> Result<()>,
 ) -> Response {
+    handle_with_state_io(
+        request,
+        identity,
+        admin_authorized,
+        state,
+        state_path,
+        |state| state.save(state_path),
+        execute_operation,
+    )
+}
+
+fn handle_with_state_io<F, P>(
+    request: Request,
+    identity: Option<Identity>,
+    admin_authorized: bool,
+    state: &mut State,
+    state_path: &Path,
+    persist: P,
+    execute_operation: F,
+) -> Response
+where
+    F: FnOnce(&Operation, &[InstallerGrant]) -> Result<()>,
+    P: FnMut(&State) -> Result<()>,
+{
+    let protocol_version = request.v;
+    let mut response = handle_inner(
+        request,
+        identity,
+        admin_authorized,
+        state,
+        state_path,
+        persist,
+        execute_operation,
+    );
+    response.v = protocol_version;
+    response
+}
+
+fn handle_inner<F, P>(
+    request: Request,
+    identity: Option<Identity>,
+    admin_authorized: bool,
+    state: &mut State,
+    state_path: &Path,
+    persist: P,
+    execute_operation: F,
+) -> Response
+where
+    F: FnOnce(&Operation, &[InstallerGrant]) -> Result<()>,
+    P: FnMut(&State) -> Result<()>,
+{
     if !matches!(request.v, PROTOCOL_VERSION | INSTALLER_PROTOCOL_VERSION) {
         return respond(
             &request.id,
@@ -1020,7 +1067,7 @@ fn handle_inner(
                     None,
                 );
             }
-            match state.submit(identity, operation, state_path) {
+            match state.submit_with(identity, operation, persist, execute_operation) {
                 Ok(receipt) => operation_response(&request.id, receipt),
                 Err(error) => respond(
                     &request.id,
@@ -1257,20 +1304,7 @@ fn read_request(
 ) -> Result<(Request, Option<Identity>, bool)> {
     let uid = peer_uid(stream)?;
     let pid = peer_pid(stream)?;
-    let mut stream = stream;
-    let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let read = stream.read(&mut byte)?;
-        if read == 0 || byte[0] == b'\n' {
-            break;
-        }
-        if bytes.len() >= MAX_REQUEST_BYTES {
-            bail!("bridge request exceeds the size limit");
-        }
-        bytes.push(byte[0]);
-    }
-    let request: Request = serde_json::from_slice(&bytes).context("parse bridge request")?;
+    let request = read_request_frame(stream)?;
     if matches!(
         request.op.as_str(),
         "authorize_pairing" | "authorize_package" | "revoke_package"
@@ -1304,6 +1338,23 @@ fn read_request(
         None
     };
     Ok((request, identity, false))
+}
+
+fn read_request_frame(stream: &UnixStream) -> Result<Request> {
+    let mut stream = stream;
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = stream.read(&mut byte)?;
+        if read == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() >= MAX_REQUEST_BYTES {
+            bail!("bridge request exceeds the size limit");
+        }
+        bytes.push(byte[0]);
+    }
+    serde_json::from_slice(&bytes).context("parse bridge request")
 }
 
 fn peer_uid(stream: &UnixStream) -> Result<u32> {
@@ -2790,6 +2841,234 @@ mod tests {
             Path::new("unused"),
         );
         assert!(!rejected.ok);
+    }
+
+    #[test]
+    fn isolated_socket_to_handler_to_injected_executor_to_correlated_receipt() {
+        // Isolated versions of the real serve-loop seams: `bind_console_listener`
+        // binds a temp socket, raw bytes use the production frame decoder,
+        // the operation goes through the production handler with fixture
+        // authentication and a recording executor, and the correlated
+        // receipt plus status lookup come back by operation ID. Peer codesign
+        // authentication cannot run for this unprivileged fixture, so the
+        // test supplies the identity after decoding the same wire bytes. The
+        // production `read_request` authentication path and allowlists remain
+        // unchanged and are covered by their existing rejection tests.
+        let directory = tempfile::tempdir().expect("create isolated socket directory");
+        let state_directory = tempfile::tempdir().expect("create isolated state directory");
+        let expected_uid = unsafe { libc::geteuid() };
+        let listener = bind_console_listener(directory.path(), expected_uid, |_, _| Ok(()))
+            .expect("bind isolated console-user socket");
+        listener
+            .listener
+            .set_nonblocking(false)
+            .expect("blocking accept");
+        let state_path = state_directory.path().join("state.json");
+        let mut state = State::load(&state_path).expect("load isolated state");
+        let app_identity = identity();
+        // Simulated administrator approval with a fixture identity.
+        state
+            .authorize_pairing_with(&app_identity, |_| Ok(()))
+            .expect("approve fixture pairing");
+        state
+            .pair_with(
+                &app_identity,
+                PairingRequest {
+                    bundle_identifier: app_identity.bundle_identifier.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+                |_| Ok(()),
+            )
+            .expect("pair fixture identity");
+
+        // 1) Wire round trip over the real socket framing: capabilities.
+        let mut client = UnixStream::connect(socket_path(directory.path(), expected_uid))
+            .expect("connect isolated client");
+        client
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .expect("client write timeout");
+        let mut request_bytes = serde_json::to_vec(&Request {
+            v: PROTOCOL_VERSION,
+            id: "wire-capabilities".to_string(),
+            op: "capabilities".to_string(),
+            repo: String::new(),
+            module: None,
+            yaml: None,
+        })
+        .expect("serialize wire request");
+        request_bytes.push(b'\n');
+        client
+            .write_all(&request_bytes)
+            .expect("write wire request");
+        let (mut accepted, _) = listener.listener.accept().expect("accept isolated client");
+        configure_accepted_stream(&accepted).expect("configure accepted stream");
+        let (wire_request, identity, admin_authorized) =
+            read_request(&accepted, expected_uid).expect("read wire request");
+        assert_eq!(wire_request.id, "wire-capabilities");
+        assert!(identity.is_none());
+        assert!(!admin_authorized);
+        let response = handle(
+            wire_request,
+            Some(app_identity.clone()),
+            false,
+            &mut state,
+            &state_path,
+        );
+        assert!(response.ok, "handler rejected: {:?}", response.message);
+        write_response(&mut accepted, &response).expect("write wire response");
+        let mut response_bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let count = client.read(&mut byte).expect("read wire response");
+            if count == 0 || byte[0] == b'\n' {
+                break;
+            }
+            response_bytes.push(byte[0]);
+        }
+        let read_back: Response =
+            serde_json::from_slice(&response_bytes).expect("decode wire response");
+        assert_eq!(read_back.id, "wire-capabilities");
+        assert!(read_back.ok);
+        let report: CapabilityReport =
+            serde_json::from_value(read_back.snapshot.clone().expect("capability snapshot"))
+                .expect("decode capability report");
+        assert_eq!(report.capabilities, vec![Capability::WifiNetworkChange]);
+        drop(client);
+
+        // 2) Operation wire bytes through the production frame decoder and
+        // handler, with fixture authentication and an injected executor.
+        let operation = operation_request("socket-correlated");
+        let operation_request = Request {
+            v: PROTOCOL_VERSION,
+            id: "wire-operation".to_string(),
+            op: "operation".to_string(),
+            repo: String::new(),
+            module: None,
+            yaml: Some(serde_json::to_string(&operation).expect("serialize operation request")),
+        };
+        let executed = std::cell::Cell::new(0);
+        let mut operation_bytes =
+            serde_json::to_vec(&operation_request).expect("serialize wire operation");
+        operation_bytes.push(b'\n');
+        let mut operation_client = UnixStream::connect(socket_path(directory.path(), expected_uid))
+            .expect("connect operation client");
+        operation_client
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("operation read timeout");
+        operation_client
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .expect("operation write timeout");
+        operation_client
+            .write_all(&operation_bytes)
+            .expect("write operation request");
+        let (mut operation_accepted, _) =
+            listener.listener.accept().expect("accept operation client");
+        configure_accepted_stream(&operation_accepted).expect("configure operation stream");
+        let wire_operation =
+            read_request_frame(&operation_accepted).expect("decode operation wire request");
+        assert_eq!(wire_operation.id, "wire-operation");
+        assert_eq!(wire_operation.op, "operation");
+        let response = handle_with_state_io(
+            wire_operation,
+            Some(app_identity.clone()),
+            false,
+            &mut state,
+            &state_path,
+            |_| Ok(()),
+            |operation, grants| {
+                assert!(grants.is_empty());
+                assert_eq!(
+                    *operation,
+                    Operation::SetWifiNetwork {
+                        ssid: "Saved network".to_string()
+                    }
+                );
+                executed.set(executed.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(response.ok, "handler rejected: {:?}", response.message);
+        write_response(&mut operation_accepted, &response).expect("write operation response");
+        let mut operation_response_bytes = Vec::new();
+        loop {
+            let count = operation_client
+                .read(&mut byte)
+                .expect("read operation response");
+            if count == 0 || byte[0] == b'\n' {
+                break;
+            }
+            operation_response_bytes.push(byte[0]);
+        }
+        let operation_response_readback: Response =
+            serde_json::from_slice(&operation_response_bytes).expect("decode operation response");
+        assert!(operation_response_readback.ok);
+        let receipt: OperationReceipt = serde_json::from_value(
+            operation_response_readback
+                .snapshot
+                .clone()
+                .expect("operation receipt snapshot"),
+        )
+        .expect("decode operation receipt");
+        assert_eq!(executed.get(), 1);
+        assert_eq!(receipt.operation_id.as_str(), "socket-correlated");
+        assert_eq!(receipt.state, OperationState::Succeeded);
+        assert_eq!(receipt.protocol_version, PROTOCOL_VERSION);
+        // 3) Correlation: replay returns the same receipt without
+        // executing again, and status lookup by original ID matches.
+        drop(operation_client);
+        let replay_response = handle_with_state_io(
+            Request {
+                v: PROTOCOL_VERSION,
+                id: "wire-operation-replay".to_string(),
+                op: "operation".to_string(),
+                repo: String::new(),
+                module: None,
+                yaml: Some(serde_json::to_string(&operation).expect("serialize replay")),
+            },
+            Some(app_identity.clone()),
+            false,
+            &mut state,
+            &state_path,
+            |_| Ok(()),
+            |_, _| {
+                executed.set(executed.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(replay_response.ok);
+        let replay: OperationReceipt =
+            serde_json::from_value(replay_response.snapshot.expect("replay receipt snapshot"))
+                .expect("decode replay receipt");
+        assert_eq!(replay, receipt);
+        assert_eq!(executed.get(), 1);
+        let status_response = handle(
+            Request {
+                v: PROTOCOL_VERSION,
+                id: "wire-status".to_string(),
+                op: "operation_status".to_string(),
+                repo: String::new(),
+                module: None,
+                yaml: Some(
+                    serde_json::to_string(&OperationStatusRequest {
+                        protocol_version: PROTOCOL_VERSION,
+                        operation_id: operation.operation_id.clone(),
+                    })
+                    .expect("serialize status request"),
+                ),
+            },
+            Some(app_identity),
+            false,
+            &mut state,
+            &state_path,
+        );
+        assert!(status_response.ok);
+        let status: OperationReceipt =
+            serde_json::from_value(status_response.snapshot.expect("status receipt snapshot"))
+                .expect("decode status receipt");
+        assert_eq!(status, receipt);
     }
 
     #[test]

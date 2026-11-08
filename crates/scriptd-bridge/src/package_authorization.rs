@@ -281,4 +281,18 @@ mod tests {
         };
         assert!(consume(&identity(), &request, false).is_err());
     }
+    #[test]
+    fn a_valid_unrelated_authorization_reference_cannot_supply_the_package_right() {
+        let authorization = Authorization::empty().unwrap();
+        let mut external = AuthorizationExternalForm { bytes: [0; 32] };
+        let status = unsafe {
+            objc2_security::AuthorizationMakeExternalForm(authorization.0, (&mut external).into())
+        };
+        assert_eq!(status, 0);
+        assert!(validate_external(
+            "com.astronlab.scriptd.package.never-issued-test",
+            &external.bytes
+        )
+        .is_err());
+    }
 }

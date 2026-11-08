@@ -10,6 +10,13 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use objc2_core_foundation::{CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_security::{
+    kAuthorizationRightExecute, kSecCSSigningInformation, kSecCodeInfoIdentifier,
+    kSecCodeInfoTeamIdentifier, kSecCodeInfoUnique, kSecGuestAttributeAudit, kSecGuestAttributePid,
+    AuthorizationCreate, AuthorizationFlags, AuthorizationFree, AuthorizationItem,
+    AuthorizationItemSet, AuthorizationRef, SecCSFlags, SecCode, SecStaticCode,
+};
 use scriptd_bridge_protocol::{
     Capability, CapabilityReport, Operation, OperationReceipt, OperationRequest, OperationState,
     OperationStatusRequest, PairingReceipt, PairingRequest, PairingStatus,
@@ -17,13 +24,14 @@ use scriptd_bridge_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 mod installer;
 
+#[cfg(test)]
 const BRIDGE_BINARY: &str = "/usr/local/libexec/scriptd-bridge";
-const INSTALLATION_RECEIPT: &str = "/Library/Application Support/scriptd/bridge-installation.json";
-const STATE_FILE: &str = "/Library/Application Support/scriptd/bridge-state.json";
-const SOCKET_DIRECTORY: &str = "/var/run/scriptd";
+const EXPECTED_TEAM_IDENTIFIER: &str = "FGRZTQB885";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECEIPTS: usize = 4096;
@@ -36,6 +44,97 @@ const DIRECT_MODULE_BUNDLE_IDENTIFIERS: &[&str] = &[
     "com.astronlab.macmodules.mwifi",
     "com.astronlab.macmodules.miwatch",
 ];
+const LOCAL_PEERTOKEN: libc::c_int = 0x006;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HelperProfile {
+    Brew,
+    Wifi,
+    AllInOne,
+}
+
+impl HelperProfile {
+    fn accepts_bundle(self, bundle_identifier: &str) -> bool {
+        match self {
+            Self::Brew => bundle_identifier == "com.astronlab.macmodules.mbrew",
+            Self::Wifi => bundle_identifier == "com.astronlab.macmodules.mwifi",
+            Self::AllInOne => bundle_identifier == DIRECT_APP_BUNDLE_IDENTIFIER,
+        }
+    }
+}
+
+static ACTIVE_PROFILE: OnceLock<HelperProfile> = OnceLock::new();
+
+fn authorize_administrator() -> Result<()> {
+    let mut item = AuthorizationItem {
+        name: kAuthorizationRightExecute.as_ptr(),
+        valueLength: 0,
+        value: std::ptr::null_mut(),
+        flags: 0,
+    };
+    let rights = AuthorizationItemSet {
+        count: 1,
+        items: &mut item,
+    };
+    let flags = AuthorizationFlags::InteractionAllowed
+        | AuthorizationFlags::ExtendRights
+        | AuthorizationFlags::DestroyRights
+        | AuthorizationFlags::PreAuthorize;
+    let mut authorization: AuthorizationRef = std::ptr::null();
+    let status =
+        unsafe { AuthorizationCreate(&rights, std::ptr::null(), flags, &mut authorization) };
+    if status != 0 || authorization.is_null() {
+        bail!("administrator authorization was not granted (status {status})");
+    }
+    let free_status =
+        unsafe { AuthorizationFree(authorization, AuthorizationFlags::DestroyRights) };
+    if free_status != 0 {
+        bail!("administrator authorization could not be released (status {free_status})");
+    }
+    Ok(())
+}
+
+fn profile_component() -> &'static str {
+    match ACTIVE_PROFILE.get().copied() {
+        Some(HelperProfile::Brew) => "brew",
+        Some(HelperProfile::Wifi) => "wifi",
+        Some(HelperProfile::AllInOne) => "all-in-one",
+        None => "legacy",
+    }
+}
+
+fn state_file() -> PathBuf {
+    if ACTIVE_PROFILE.get().is_none() {
+        return PathBuf::from("/Library/Application Support/scriptd/bridge-state.json");
+    }
+    PathBuf::from(format!(
+        "/Library/Application Support/scriptd/{}/bridge-state.json",
+        profile_component()
+    ))
+}
+
+fn socket_directory() -> PathBuf {
+    if ACTIVE_PROFILE.get().is_none() {
+        return PathBuf::from("/var/run/scriptd");
+    }
+    PathBuf::from("/var/run/scriptd").join(profile_component())
+}
+
+fn installation_receipt() -> PathBuf {
+    if ACTIVE_PROFILE.get().is_none() {
+        return PathBuf::from("/Library/Application Support/scriptd/bridge-installation.json");
+    }
+    PathBuf::from(format!(
+        "/Library/Application Support/scriptd/{}/bridge-installation.json",
+        profile_component()
+    ))
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AuditToken {
+    val: [u32; 8],
+}
 
 fn is_direct_distribution_identity(bundle_identifier: &str) -> bool {
     bundle_identifier == DIRECT_APP_BUNDLE_IDENTIFIER
@@ -43,17 +142,29 @@ fn is_direct_distribution_identity(bundle_identifier: &str) -> bool {
 }
 
 fn allows_wifi_capability(bundle_identifier: &str) -> bool {
-    matches!(
-        bundle_identifier,
-        "com.astronlab.scriptd" | "com.astronlab.macmodules.mwifi"
-    )
+    match ACTIVE_PROFILE.get().copied() {
+        Some(profile) => {
+            matches!(profile, HelperProfile::Wifi | HelperProfile::AllInOne)
+                && profile.accepts_bundle(bundle_identifier)
+        }
+        None => matches!(
+            bundle_identifier,
+            "com.astronlab.scriptd" | "com.astronlab.macmodules.mwifi"
+        ),
+    }
 }
 
 fn allows_installer_capability(bundle_identifier: &str) -> bool {
-    matches!(
-        bundle_identifier,
-        "com.astronlab.scriptd" | "com.astronlab.macmodules.mbrew"
-    )
+    match ACTIVE_PROFILE.get().copied() {
+        Some(profile) => {
+            matches!(profile, HelperProfile::Brew | HelperProfile::AllInOne)
+                && profile.accepts_bundle(bundle_identifier)
+        }
+        None => matches!(
+            bundle_identifier,
+            "com.astronlab.scriptd" | "com.astronlab.macmodules.mbrew"
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +287,17 @@ impl State {
     }
 
     fn require_pairing(&self, identity: &Identity) -> Result<()> {
+        // Embedded service profiles are registered by SMAppService from the
+        // owning signed app bundle. Their exact identity/profile pair is
+        // checked by capabilities and every operation; no manual pairing state
+        // is needed for these new builds.
+        if let Some(profile) = ACTIVE_PROFILE.get().copied() {
+            validate_identity(identity)?;
+            if profile.accepts_bundle(&identity.bundle_identifier) {
+                return Ok(());
+            }
+            bail!("the embedded helper rejected an application identity outside its profile");
+        }
         let pairing = self
             .pairings
             .get(&identity.bundle_identifier)
@@ -742,6 +864,122 @@ fn handle_inner(
                 ),
             }
         }
+        "request_authorize_pairing" => {
+            let Some(identity) = identity else {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("app signature is not verified".into()),
+                    None,
+                );
+            };
+            if let Err(error) = authorize_administrator() {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some(error.to_string()),
+                    None,
+                );
+            }
+            match state.authorize_pairing(&identity, state_path) {
+                Ok(()) => respond(
+                    &request.id,
+                    true,
+                    "completed",
+                    Some("one pairing approval recorded".into()),
+                    None,
+                ),
+                Err(error) => respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some(error.to_string()),
+                    None,
+                ),
+            }
+        }
+        "request_authorize_package" | "request_revoke_package" => {
+            let Some(identity) = identity else {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("app signature is not verified".into()),
+                    None,
+                );
+            };
+            if !allows_installer_capability(&identity.bundle_identifier) {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("package approval is unavailable to this app profile".into()),
+                    None,
+                );
+            }
+            let Some(payload) = request.yaml.as_deref() else {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("package approval request is incomplete".into()),
+                    None,
+                );
+            };
+            let query: InstallerApprovalQuery = match serde_json::from_str(payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return respond(
+                        &request.id,
+                        false,
+                        "rejected",
+                        Some(format!("invalid package approval request: {error}")),
+                        None,
+                    )
+                }
+            };
+            if let Err(error) = authorize_administrator() {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some(error.to_string()),
+                    None,
+                );
+            }
+            let revoke = request.op == "request_revoke_package";
+            let grant = InstallerGrant {
+                app_identity: identity,
+                publisher_team_identifier: query.publisher_team_identifier,
+                package_identifier: query.package_identifier,
+                method: "package_installer_v1".into(),
+            };
+            match state.set_installer_grant(grant, revoke, state_path) {
+                Ok(()) => respond(
+                    &request.id,
+                    true,
+                    "completed",
+                    Some(
+                        if revoke {
+                            "future package authorization revoked"
+                        } else {
+                            "package publisher authorization recorded"
+                        }
+                        .into(),
+                    ),
+                    None,
+                ),
+                Err(error) => respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some(error.to_string()),
+                    None,
+                ),
+            }
+        }
         "authorize_package" | "revoke_package" => {
             if !admin_authorized {
                 return respond(
@@ -1179,16 +1417,22 @@ fn serve() -> Result<()> {
         bail!("the bridge service must run as root");
     }
     verify_installation()?;
-    let socket_directory = Path::new(SOCKET_DIRECTORY);
-    fs::create_dir_all(socket_directory).context("create protected bridge socket directory")?;
-    let directory_metadata = fs::symlink_metadata(socket_directory)?;
+    let state_path = state_file();
+    let state_directory = state_path
+        .parent()
+        .context("bridge state path has no profile directory")?;
+    fs::create_dir_all(state_directory).context("create profile state directory")?;
+    fs::set_permissions(state_directory, fs::Permissions::from_mode(0o700))
+        .context("protect profile state directory")?;
+    let socket_directory = socket_directory();
+    fs::create_dir_all(&socket_directory).context("create protected bridge socket directory")?;
+    let directory_metadata = fs::symlink_metadata(&socket_directory)?;
     if !directory_metadata.is_dir()
         || directory_metadata.uid() != 0
         || directory_metadata.mode() & 0o022 != 0
     {
         bail!("bridge socket directory must be protected and root-owned");
     }
-    let state_path = PathBuf::from(STATE_FILE);
     let mut state = State::load(&state_path)?;
     let mut active = None;
     loop {
@@ -1205,7 +1449,7 @@ fn serve() -> Result<()> {
         };
         if !matches!(active.as_ref(), Some(listener) if listener.uid == uid) {
             if let Err(error) =
-                replace_console_listener(&mut active, socket_directory, uid, chown_socket)
+                replace_console_listener(&mut active, &socket_directory, uid, chown_socket)
             {
                 eprintln!("could not bind bridge for console user {uid}: {error:#}");
                 std::thread::sleep(Duration::from_millis(500));
@@ -1257,6 +1501,7 @@ fn read_request(
 ) -> Result<(Request, Option<Identity>, bool)> {
     let uid = peer_uid(stream)?;
     let pid = peer_pid(stream)?;
+    let audit_token = peer_audit_token(stream)?;
     let mut stream = stream;
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
@@ -1278,8 +1523,8 @@ fn read_request(
         if uid != 0 {
             bail!("administrator approval requires a root-owned bridge client");
         }
-        let client_identity = authenticate_peer(pid)?;
-        let bridge_identity = authenticate_peer_identity_path(Path::new(BRIDGE_BINARY))?;
+        let client_identity = authenticate_peer_token(pid, audit_token)?;
+        let bridge_identity = authenticate_peer_identity_path(&std::env::current_exe()?)?;
         if client_identity != bridge_identity {
             bail!("administrator approval must come from the installed bridge executable");
         }
@@ -1297,9 +1542,12 @@ fn read_request(
             | "operation_status"
             | "package_approval_status"
             | "package_approval_list"
+            | "request_authorize_pairing"
+            | "request_authorize_package"
+            | "request_revoke_package"
     ) || (request.op == "capabilities" && request.v == INSTALLER_PROTOCOL_VERSION)
     {
-        Some(authenticate_peer(pid)?)
+        Some(authenticate_peer_token(pid, audit_token)?)
     } else {
         None
     };
@@ -1335,19 +1583,40 @@ fn peer_pid(stream: &UnixStream) -> Result<u32> {
     Ok(pid as u32)
 }
 
+fn peer_audit_token(stream: &UnixStream) -> Result<Option<AuditToken>> {
+    use std::os::fd::AsRawFd;
+    let mut token = AuditToken { val: [0; 8] };
+    let mut length = std::mem::size_of_val(&token) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            LOCAL_PEERTOKEN,
+            (&mut token as *mut AuditToken).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("read bridge peer audit token");
+    }
+    if length as usize != std::mem::size_of::<AuditToken>() {
+        bail!("bridge peer audit token has an unexpected size");
+    }
+    Ok(Some(token))
+}
+
+#[cfg(test)]
 fn authenticate_peer(pid: u32) -> Result<Identity> {
+    authenticate_peer_token(pid, None)
+}
+
+fn authenticate_peer_token(pid: u32, audit_token: Option<AuditToken>) -> Result<Identity> {
     const PROC_PIDPATHINFO_MAXSIZE: u32 = 4096;
     extern "C" {
         fn proc_pidpath(
             pid: libc::c_int,
             buffer: *mut libc::c_void,
             buffersize: u32,
-        ) -> libc::c_int;
-        fn csops(
-            pid: libc::pid_t,
-            ops: libc::c_uint,
-            data: *mut libc::c_void,
-            size: usize,
         ) -> libc::c_int;
     }
     let mut path_bytes = vec![0_u8; PROC_PIDPATHINFO_MAXSIZE as usize];
@@ -1371,6 +1640,8 @@ fn authenticate_peer(pid: u32) -> Result<Identity> {
     // Use the kernel-bound PID for every codesign query so pathname replacement
     // cannot switch identities between metadata and distribution verification.
     let process_reference = process_code_reference(pid);
+    let (security_identifier, security_team, security_cdhash) =
+        security_identity_for_process(pid, audit_token)?;
     let verify = Command::new("/usr/bin/codesign")
         .args(["--verify", "--strict", "--all-architectures", "--"])
         .arg(&process_reference)
@@ -1409,7 +1680,14 @@ fn authenticate_peer(pid: u32) -> Result<Identity> {
     let team = team
         .filter(|value| !value.is_empty() && value != "not set")
         .context("bridge peer must have a distribution signer")?;
+    if team != EXPECTED_TEAM_IDENTIFIER {
+        bail!("bridge peer was signed by an unexpected team");
+    }
     let identifier = identifier.context("bridge peer has no bundle identifier")?;
+    let cdhash = cdhash.context("bridge peer signature has no code-directory hash")?;
+    if identifier != security_identifier || team != security_team || cdhash != security_cdhash {
+        bail!("bridge peer executable changed during identity verification");
+    }
     if signature.as_deref() == Some("adhoc") {
         bail!("ad-hoc signed apps cannot pair with the bridge");
     }
@@ -1429,27 +1707,93 @@ fn authenticate_peer(pid: u32) -> Result<Identity> {
     if !verify_distribution.status.success() {
         bail!("bridge peer must be signed for Developer ID distribution");
     }
-    let cdhash = cdhash.context("bridge peer signature has no code-directory hash")?;
-    let mut running_hash = [0_u8; 20];
-    if unsafe {
-        csops(
-            pid as libc::pid_t,
-            5,
-            running_hash.as_mut_ptr().cast(),
-            running_hash.len(),
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error())
-            .context("read bridge peer code-directory hash");
-    }
-    if hex::encode(running_hash) != cdhash {
-        bail!("bridge peer executable changed during identity verification");
-    }
     Ok(Identity {
         team_identifier: team,
         bundle_identifier: identifier,
     })
+}
+
+fn security_identity_for_process(
+    pid: u32,
+    audit_token: Option<AuditToken>,
+) -> Result<(String, String, String)> {
+    let pid_value = CFNumber::new_i32(pid as i32);
+    let pid_key = unsafe { kSecGuestAttributePid };
+    let audit_data = audit_token.map(|token| {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(token.val.as_ptr().cast::<u8>(), token.val.len() * 4)
+        };
+        CFData::from_bytes(bytes)
+    });
+    let typed_attributes = if let Some(audit_data) = audit_data.as_ref() {
+        let key = unsafe { kSecGuestAttributeAudit };
+        CFDictionary::<CFString, CFType>::from_slices(&[key], &[audit_data.as_ref()])
+    } else {
+        CFDictionary::<CFString, CFType>::from_slices(&[pid_key], &[pid_value.as_ref()])
+    };
+    let attributes: &CFDictionary = unsafe {
+        &*(typed_attributes.as_ref() as *const CFDictionary<CFString, CFType>
+            as *const CFDictionary)
+    };
+    let mut guest_pointer: *mut SecCode = std::ptr::null_mut();
+    let status = unsafe {
+        SecCode::copy_guest_with_attributes(
+            None,
+            Some(attributes),
+            SecCSFlags(0),
+            NonNull::from(&mut guest_pointer),
+        )
+    };
+    if status != 0 {
+        bail!("resolve bridge peer code identity: security status {status}");
+    }
+    let guest_pointer = NonNull::new(guest_pointer)
+        .context("security framework returned a null bridge peer code reference")?;
+    let guest: CFRetained<SecCode> = unsafe { CFRetained::from_raw(guest_pointer) };
+    let validity = unsafe { guest.check_validity(SecCSFlags(0), None) };
+    if validity != 0 {
+        bail!("bridge peer code signature is invalid: security status {validity}");
+    }
+    let mut static_pointer: *const SecStaticCode = std::ptr::null();
+    let status =
+        unsafe { guest.copy_static_code(SecCSFlags(0), NonNull::from(&mut static_pointer)) };
+    if status != 0 {
+        bail!("resolve bridge peer static code: security status {status}");
+    }
+    let static_pointer = NonNull::new(static_pointer.cast_mut())
+        .context("security framework returned null static code")?;
+    let static_code: CFRetained<SecStaticCode> = unsafe { CFRetained::from_raw(static_pointer) };
+    let mut information_pointer: *const CFDictionary = std::ptr::null();
+    let status = unsafe {
+        SecCode::copy_signing_information(
+            &static_code,
+            SecCSFlags(kSecCSSigningInformation),
+            NonNull::from(&mut information_pointer),
+        )
+    };
+    if status != 0 {
+        bail!("read bridge peer signing information: security status {status}");
+    }
+    let information_pointer = NonNull::new(information_pointer.cast_mut())
+        .context("security framework returned null signing information")?;
+    let information: CFRetained<CFDictionary<CFString, CFType>> =
+        unsafe { CFRetained::cast_unchecked(CFRetained::from_raw(information_pointer)) };
+    let string_value = |key: &'static CFString, label: &str| -> Result<String> {
+        information
+            .get(key)
+            .and_then(|value| value.downcast::<CFString>().ok())
+            .map(|value| value.to_string())
+            .context(format!(
+                "bridge peer signing information is missing {label}"
+            ))
+    };
+    let team = string_value(unsafe { kSecCodeInfoTeamIdentifier }, "the team identifier")?;
+    let identifier = string_value(unsafe { kSecCodeInfoIdentifier }, "the identifier")?;
+    let cdhash = information
+        .get(unsafe { kSecCodeInfoUnique })
+        .and_then(|value| value.downcast::<CFData>().ok())
+        .context("bridge peer signing information is missing the CDHash")?;
+    Ok((identifier, team, hex::encode(cdhash.to_vec())))
 }
 
 fn developer_id_requirement(team: &str, identifier: &str) -> Result<String> {
@@ -1555,12 +1899,27 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn verify_installation() -> Result<()> {
-    let receipt_bytes = read_root_file(Path::new(INSTALLATION_RECEIPT))
-        .context("read bridge installation receipt")?;
+    if ACTIVE_PROFILE.get().is_some() {
+        let executable = std::env::current_exe()?;
+        if !executable
+            .to_string_lossy()
+            .contains("/Contents/MacOS/scriptd-bridge")
+        {
+            bail!("embedded helper is not running from its containing app bundle");
+        }
+        let identity = authenticate_peer_identity_path(&executable)?;
+        if identity.team_identifier != EXPECTED_TEAM_IDENTIFIER {
+            bail!("embedded helper was not signed by the expected development team");
+        }
+        return Ok(());
+    }
+    let receipt_path = installation_receipt();
+    let receipt_bytes =
+        read_root_file(&receipt_path).context("read bridge installation receipt")?;
     let receipt: InstallationReceipt = serde_json::from_slice(&receipt_bytes)?;
-    let binary = Path::new(BRIDGE_BINARY);
-    let binary_bytes = fs::read(binary)?;
-    let identity = authenticate_peer_identity_path(binary)?;
+    let binary = std::env::current_exe()?;
+    let binary_bytes = fs::read(&binary)?;
+    let identity = authenticate_peer_identity_path(&binary)?;
     if receipt.schema != "scriptd-bridge-installation/v1"
         || receipt.protocol_version != PROTOCOL_VERSION
         || receipt.binary_sha256 != digest(&binary_bytes)
@@ -1610,14 +1969,20 @@ fn write_installation_receipt() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("writing the bridge installation receipt requires administrator privileges");
     }
-    let binary_path = Path::new(BRIDGE_BINARY);
-    let metadata = fs::symlink_metadata(binary_path)?;
+    let binary_path = std::env::current_exe()?;
+    let metadata = fs::symlink_metadata(&binary_path)?;
     if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
         bail!("installed bridge executable must be protected and root-owned");
     }
-    let parent = Path::new(INSTALLATION_RECEIPT)
+    let receipt_path = installation_receipt();
+    let parent = receipt_path
         .parent()
         .context("bridge receipt directory missing")?;
+    match fs::create_dir(parent) {
+        Ok(()) => fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("create profile installation directory"),
+    }
     let parent_metadata = fs::symlink_metadata(parent)?;
     if !parent_metadata.is_dir()
         || parent_metadata.uid() != 0
@@ -1625,18 +1990,15 @@ fn write_installation_receipt() -> Result<()> {
     {
         bail!("bridge receipt directory must be protected and root-owned");
     }
-    let identity = authenticate_peer_identity_path(binary_path)?;
+    let identity = authenticate_peer_identity_path(&binary_path)?;
     let receipt = InstallationReceipt {
         schema: "scriptd-bridge-installation/v1".to_string(),
         protocol_version: PROTOCOL_VERSION,
-        binary_sha256: digest(&fs::read(binary_path)?),
+        binary_sha256: digest(&fs::read(&binary_path)?),
         team_identifier: identity.team_identifier,
         bundle_identifier: identity.bundle_identifier,
     };
-    write_root_atomic(
-        Path::new(INSTALLATION_RECEIPT),
-        &serde_json::to_vec(&receipt)?,
-    )
+    write_root_atomic(&installation_receipt(), &serde_json::to_vec(&receipt)?)
 }
 
 pub(crate) fn console_uid() -> Result<u32> {
@@ -1750,9 +2112,30 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let mut args = std::env::args();
-    let _program = args.next();
-    match args.next().as_deref() {
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(index) = args.iter().position(|argument| argument == "--profile") {
+        let profile = args
+            .get(index + 1)
+            .context("missing helper profile value")?
+            .as_str();
+        let parsed = match profile {
+            "brew" => HelperProfile::Brew,
+            "wifi" => HelperProfile::Wifi,
+            "all-in-one" => HelperProfile::AllInOne,
+            _ => bail!("unsupported helper profile"),
+        };
+        ACTIVE_PROFILE
+            .set(parsed)
+            .map_err(|_| anyhow::anyhow!("helper profile was configured more than once"))?;
+        args.drain(index..=index + 1);
+    }
+    let command = if args.is_empty() {
+        Some("serve".to_owned())
+    } else {
+        args.first().cloned()
+    };
+    let mut args = args.into_iter().skip(usize::from(command.is_some()));
+    match command.as_deref() {
         Some("serve") => serve(),
         Some("write-installation-receipt") => write_installation_receipt(),
         Some("authorize-pairing") => {
@@ -1799,7 +2182,8 @@ fn authorize_pairing_command(team_identifier: String, bundle_identifier: String)
     };
     validate_identity(&identity)?;
     let uid = console_uid()?;
-    let socket = socket_path(Path::new(SOCKET_DIRECTORY), uid);
+    let socket_directory = socket_directory();
+    let socket = socket_path(&socket_directory, uid);
     let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("connect to bridge at {}", socket.display()))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -1869,7 +2253,8 @@ fn set_package_approval_command(
     validate_team_identifier(&grant.publisher_team_identifier)?;
     validate_package_identifier(&grant.package_identifier)?;
     let uid = console_uid()?;
-    let socket = socket_path(Path::new(SOCKET_DIRECTORY), uid);
+    let socket_directory = socket_directory();
+    let socket = socket_path(&socket_directory, uid);
     let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("connect to bridge at {}", socket.display()))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -1973,7 +2358,8 @@ mod tests {
             module: None,
             yaml: payload,
         };
-        let socket = socket_path(Path::new(SOCKET_DIRECTORY), console_uid()?);
+        let socket_directory = socket_directory();
+        let socket = socket_path(&socket_directory, console_uid()?);
         let mut stream = UnixStream::connect(&socket)
             .with_context(|| format!("connect to running bridge at {}", socket.display()))?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -2104,10 +2490,7 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(100));
             };
-            let socket = socket_path(
-                Path::new(SOCKET_DIRECTORY),
-                console_uid().expect("console user"),
-            );
+            let socket = socket_path(&socket_directory(), console_uid().expect("console user"));
             loop {
                 if UnixStream::connect(&socket).is_ok() {
                     break;
@@ -2162,7 +2545,8 @@ mod tests {
 
     fn smoke_operation_state(operation_id: &str) -> Option<String> {
         let output = Command::new("/usr/bin/sudo")
-            .args(["-n", "/bin/cat", STATE_FILE])
+            .arg("-n")
+            .arg(state_file())
             .output()
             .ok()?;
         if !output.status.success() {
@@ -2991,6 +3375,24 @@ mod tests {
         assert!(!allows_wifi_capability(
             "com.astronlab.macmodules.mwifi.store"
         ));
+    }
+
+    #[test]
+    fn embedded_profiles_accept_only_their_owning_application() {
+        let brew = HelperProfile::Brew;
+        assert!(brew.accepts_bundle("com.astronlab.macmodules.mbrew"));
+        assert!(!brew.accepts_bundle("com.astronlab.macmodules.mwifi"));
+        assert!(!brew.accepts_bundle(DIRECT_APP_BUNDLE_IDENTIFIER));
+
+        let wifi = HelperProfile::Wifi;
+        assert!(wifi.accepts_bundle("com.astronlab.macmodules.mwifi"));
+        assert!(!wifi.accepts_bundle("com.astronlab.macmodules.mbrew"));
+        assert!(!wifi.accepts_bundle(DIRECT_APP_BUNDLE_IDENTIFIER));
+
+        let all_in_one = HelperProfile::AllInOne;
+        assert!(all_in_one.accepts_bundle(DIRECT_APP_BUNDLE_IDENTIFIER));
+        assert!(!all_in_one.accepts_bundle("com.astronlab.macmodules.mbrew"));
+        assert!(!all_in_one.accepts_bundle("com.astronlab.macmodules.mwifi"));
     }
 
     #[test]

@@ -15,5 +15,9 @@ serde_json = "1.0"
 sha2 = "0.10"
 scriptd-bridge-protocol = { path = "../scriptd-bridge-protocol" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", features = ["CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-security = { version = "0.3.2", features = ["Authorization", "AuthorizationTags", "CSCommon", "SecCode"] }
+
 [dev-dependencies]
 tempfile = "3.10"

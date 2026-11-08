@@ -12,10 +12,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use objc2_core_foundation::{CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_security::{
-    kAuthorizationRightExecute, kSecCSSigningInformation, kSecCodeInfoIdentifier,
-    kSecCodeInfoTeamIdentifier, kSecCodeInfoUnique, kSecGuestAttributeAudit, kSecGuestAttributePid,
-    AuthorizationCreate, AuthorizationFlags, AuthorizationFree, AuthorizationItem,
-    AuthorizationItemSet, AuthorizationRef, SecCSFlags, SecCode, SecStaticCode,
+    kSecCSSigningInformation, kSecCodeInfoIdentifier, kSecCodeInfoTeamIdentifier,
+    kSecCodeInfoUnique, kSecGuestAttributeAudit, kSecGuestAttributePid, SecCSFlags, SecCode,
+    SecStaticCode,
 };
 use scriptd_bridge_protocol::{
     Capability, CapabilityReport, Operation, OperationReceipt, OperationRequest, OperationState,
@@ -65,35 +64,6 @@ impl HelperProfile {
 }
 
 static ACTIVE_PROFILE: OnceLock<HelperProfile> = OnceLock::new();
-
-fn authorize_administrator() -> Result<()> {
-    let mut item = AuthorizationItem {
-        name: kAuthorizationRightExecute.as_ptr(),
-        valueLength: 0,
-        value: std::ptr::null_mut(),
-        flags: 0,
-    };
-    let rights = AuthorizationItemSet {
-        count: 1,
-        items: &mut item,
-    };
-    let flags = AuthorizationFlags::InteractionAllowed
-        | AuthorizationFlags::ExtendRights
-        | AuthorizationFlags::DestroyRights
-        | AuthorizationFlags::PreAuthorize;
-    let mut authorization: AuthorizationRef = std::ptr::null();
-    let status =
-        unsafe { AuthorizationCreate(&rights, std::ptr::null(), flags, &mut authorization) };
-    if status != 0 || authorization.is_null() {
-        bail!("administrator authorization was not granted (status {status})");
-    }
-    let free_status =
-        unsafe { AuthorizationFree(authorization, AuthorizationFlags::DestroyRights) };
-    if free_status != 0 {
-        bail!("administrator authorization could not be released (status {free_status})");
-    }
-    Ok(())
-}
 
 fn profile_component() -> &'static str {
     match ACTIVE_PROFILE.get().copied() {
@@ -912,42 +882,6 @@ where
                 ),
             }
         }
-        "request_authorize_pairing" => {
-            let Some(identity) = identity else {
-                return respond(
-                    &request.id,
-                    false,
-                    "rejected",
-                    Some("app signature is not verified".into()),
-                    None,
-                );
-            };
-            if let Err(error) = authorize_administrator() {
-                return respond(
-                    &request.id,
-                    false,
-                    "rejected",
-                    Some(error.to_string()),
-                    None,
-                );
-            }
-            match state.authorize_pairing(&identity, state_path) {
-                Ok(()) => respond(
-                    &request.id,
-                    true,
-                    "completed",
-                    Some("one pairing approval recorded".into()),
-                    None,
-                ),
-                Err(error) => respond(
-                    &request.id,
-                    false,
-                    "rejected",
-                    Some(error.to_string()),
-                    None,
-                ),
-            }
-        }
         "prepare_authorize_package"
         | "prepare_revoke_package"
         | "request_authorize_package"
@@ -1614,7 +1548,6 @@ fn read_request(
             | "operation_status"
             | "package_approval_status"
             | "package_approval_list"
-            | "request_authorize_pairing"
             | "prepare_authorize_package"
             | "prepare_revoke_package"
             | "request_authorize_package"
@@ -4099,5 +4032,28 @@ mod tests {
         );
         assert!(!response.ok);
         assert!(response.message.unwrap().contains("unsupported"));
+    }
+    #[test]
+    fn user_callable_pairing_approval_is_rejected_without_creating_authorization() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        let response = handle(
+            Request {
+                v: PROTOCOL_VERSION,
+                id: "no-consent".into(),
+                op: "request_authorize_pairing".into(),
+                repo: String::new(),
+                module: None,
+                yaml: None,
+            },
+            Some(identity()),
+            false,
+            &mut state,
+            &temp.path().join("state.json"),
+        );
+        assert!(!response.ok);
+        assert!(state.pairing_authorizations.is_empty());
+        assert!(state.pairings.is_empty());
+        assert!(!temp.path().join("state.json").exists());
     }
 }

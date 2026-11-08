@@ -28,6 +28,7 @@ use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 mod installer;
+mod package_authorization;
 
 #[cfg(test)]
 const BRIDGE_BINARY: &str = "/usr/local/libexec/scriptd-bridge";
@@ -947,7 +948,10 @@ where
                 ),
             }
         }
-        "request_authorize_package" | "request_revoke_package" => {
+        "prepare_authorize_package"
+        | "prepare_revoke_package"
+        | "request_authorize_package"
+        | "request_revoke_package" => {
             let Some(identity) = identity else {
                 return respond(
                     &request.id,
@@ -975,19 +979,53 @@ where
                     None,
                 );
             };
-            let query: InstallerApprovalQuery = match serde_json::from_str(payload) {
-                Ok(value) => value,
-                Err(error) => {
-                    return respond(
+            if request.op.starts_with("prepare_") {
+                let result = (|| -> Result<String> {
+                    state.require_pairing(&identity)?;
+                    let query: InstallerApprovalQuery = serde_json::from_str(payload)?;
+                    package_authorization::prepare(
+                        &identity,
+                        &query,
+                        request.op == "prepare_revoke_package",
+                    )
+                })();
+                return match result {
+                    Ok(challenge) => respond(
+                        &request.id,
+                        true,
+                        "completed",
+                        None,
+                        Some(serde_json::json!({"challenge": challenge})),
+                    ),
+                    Err(error) => respond(
                         &request.id,
                         false,
                         "rejected",
-                        Some(format!("invalid package approval request: {error}")),
+                        Some(error.to_string()),
                         None,
-                    )
-                }
-            };
-            if let Err(error) = authorize_administrator() {
+                    ),
+                };
+            }
+            let authorized: package_authorization::ApprovedRequest =
+                match serde_json::from_str(payload) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return respond(
+                            &request.id,
+                            false,
+                            "rejected",
+                            Some(format!(
+                                "package-specific user authorization is required: {error}"
+                            )),
+                            None,
+                        )
+                    }
+                };
+            let revoke = request.op == "request_revoke_package";
+            if let Err(error) = state
+                .require_pairing(&identity)
+                .and_then(|()| package_authorization::consume(&identity, &authorized, revoke))
+            {
                 return respond(
                     &request.id,
                     false,
@@ -996,7 +1034,7 @@ where
                     None,
                 );
             }
-            let revoke = request.op == "request_revoke_package";
+            let query = authorized.approval;
             let grant = InstallerGrant {
                 app_identity: identity,
                 publisher_team_identifier: query.publisher_team_identifier,
@@ -1577,6 +1615,8 @@ fn read_request(
             | "package_approval_status"
             | "package_approval_list"
             | "request_authorize_pairing"
+            | "prepare_authorize_package"
+            | "prepare_revoke_package"
             | "request_authorize_package"
             | "request_revoke_package"
     ) || (request.op == "capabilities" && request.v == INSTALLER_PROTOCOL_VERSION)

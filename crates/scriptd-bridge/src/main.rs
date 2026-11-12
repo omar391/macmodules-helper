@@ -1182,12 +1182,7 @@ where
                     None,
                 );
             }
-            let active = state
-                .pairings
-                .get(&identity.bundle_identifier)
-                .is_some_and(|pairing| {
-                    pairing.active && pairing.team_identifier == identity.team_identifier
-                });
+            let active = pairing_is_active(ACTIVE_PROFILE.get().copied(), identity, state);
             let status = PairingStatus {
                 protocol_version: request.v,
                 bundle_identifier: identity.bundle_identifier.clone(),
@@ -1539,9 +1534,19 @@ fn read_request(
     if uid != expected_uid {
         bail!("bridge peer user was not accepted");
     }
-    let identity = if matches!(
-        request.op.as_str(),
-        "pair"
+    let identity = if operation_requires_peer_identity(request.op.as_str()) {
+        Some(authenticate_peer_token(pid, audit_token)?)
+    } else {
+        None
+    };
+    Ok((request, identity, false))
+}
+
+fn operation_requires_peer_identity(op: &str) -> bool {
+    matches!(
+        op,
+        "capabilities"
+            | "pair"
             | "pairing_status"
             | "unpair"
             | "operation"
@@ -1552,13 +1557,19 @@ fn read_request(
             | "prepare_revoke_package"
             | "request_authorize_package"
             | "request_revoke_package"
-    ) || (request.op == "capabilities" && request.v == INSTALLER_PROTOCOL_VERSION)
-    {
-        Some(authenticate_peer_token(pid, audit_token)?)
-    } else {
-        None
-    };
-    Ok((request, identity, false))
+    )
+}
+
+fn pairing_is_active(profile: Option<HelperProfile>, identity: &Identity, state: &State) -> bool {
+    if profile.is_some_and(|profile| profile.accepts_bundle(&identity.bundle_identifier)) {
+        return true;
+    }
+    state
+        .pairings
+        .get(&identity.bundle_identifier)
+        .is_some_and(|pairing| {
+            pairing.active && pairing.team_identifier == identity.team_identifier
+        })
 }
 
 fn read_request_frame(stream: &UnixStream) -> Result<Request> {
@@ -3262,11 +3273,11 @@ mod tests {
             .expect("write wire request");
         let (mut accepted, _) = listener.listener.accept().expect("accept isolated client");
         configure_accepted_stream(&accepted).expect("configure accepted stream");
-        let (wire_request, identity, admin_authorized) =
-            read_request(&accepted, expected_uid).expect("read wire request");
+        // Capabilities now require the signed peer. This fixture is not that
+        // peer, so the framing check stops at the production frame decoder.
+        let wire_request = read_request_frame(&accepted).expect("read wire request");
         assert_eq!(wire_request.id, "wire-capabilities");
-        assert!(identity.is_none());
-        assert!(!admin_authorized);
+        assert!(operation_requires_peer_identity(&wire_request.op));
         let response = handle(
             wire_request,
             Some(app_identity.clone()),
@@ -3467,7 +3478,7 @@ mod tests {
         configure_accepted_stream(&accepted).expect("configure accepted client stream");
 
         let request = format!(
-            r#"{{"v":{},"id":"delayed-fragmented","op":"capabilities"}}"#,
+            r#"{{"v":{},"id":"delayed-fragmented","op":"framing"}}"#,
             PROTOCOL_VERSION
         );
         let split = request.len() / 2;
@@ -3491,6 +3502,7 @@ mod tests {
             .expect("write request fragments");
         let (request, _, _) = received.expect("read delayed fragmented request");
         assert_eq!(request.id, "delayed-fragmented");
+        assert!(!operation_requires_peer_identity(&request.op));
     }
 
     #[test]
@@ -3645,6 +3657,45 @@ mod tests {
         assert!(all_in_one.accepts_bundle(DIRECT_APP_BUNDLE_IDENTIFIER));
         assert!(!all_in_one.accepts_bundle("com.astronlab.macmodules.mbrew"));
         assert!(!all_in_one.accepts_bundle("com.astronlab.macmodules.mwifi"));
+    }
+
+    #[test]
+    fn capabilities_require_a_signed_peer_on_every_protocol_version() {
+        assert!(operation_requires_peer_identity("capabilities"));
+        assert!(operation_requires_peer_identity("operation"));
+        assert!(!operation_requires_peer_identity("framing"));
+    }
+
+    #[test]
+    fn embedded_profile_pairing_is_active_without_manual_state() {
+        let app = identity();
+        let empty = State::default();
+        assert!(!pairing_is_active(None, &app, &empty));
+        assert!(pairing_is_active(
+            Some(HelperProfile::AllInOne),
+            &app,
+            &empty
+        ));
+        assert!(!pairing_is_active(Some(HelperProfile::Brew), &app, &empty));
+        let wifi = Identity {
+            team_identifier: app.team_identifier.clone(),
+            bundle_identifier: "com.astronlab.macmodules.mwifi".into(),
+        };
+        assert!(pairing_is_active(Some(HelperProfile::Wifi), &wifi, &empty));
+        assert!(!pairing_is_active(
+            Some(HelperProfile::AllInOne),
+            &wifi,
+            &empty
+        ));
+        let manual = paired_state(false);
+        assert!(
+            !pairing_is_active(None, &app, &manual),
+            "a revoked legacy pairing stays inactive"
+        );
+        assert!(
+            pairing_is_active(Some(HelperProfile::AllInOne), &app, &manual),
+            "an embedded profile is paired by its signed bundle, not manual state"
+        );
     }
 
     #[test]

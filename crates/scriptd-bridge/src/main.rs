@@ -7,7 +7,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use objc2_core_foundation::{CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
@@ -1369,40 +1369,20 @@ fn operation_response(id: &str, receipt: OperationReceipt) -> Response {
 fn execute(operation: &Operation, grants: &[InstallerGrant]) -> Result<()> {
     match operation {
         Operation::SetWifiNetwork { ssid } => {
-            let ports = Command::new("/usr/sbin/networksetup")
-                .arg("-listallhardwareports")
-                .output()
-                .context("read Wi-Fi hardware device")?;
-            if !ports.status.success() {
-                bail!("networksetup could not enumerate hardware ports");
+            let device = wifi_device()?;
+            let _ = attempt_wifi_join(&device, ssid, None);
+            if wait_for_wifi(&device, ssid) {
+                return Ok(());
             }
-            let mut device = None;
-            let mut in_wifi = false;
-            for line in String::from_utf8_lossy(&ports.stdout).lines() {
-                if let Some(value) = line.trim().strip_prefix("Hardware Port:") {
-                    in_wifi = matches!(value.trim(), "Wi-Fi" | "AirPort");
-                } else if in_wifi {
-                    if let Some(value) = line.trim().strip_prefix("Device:") {
-                        device = Some(value.trim().to_string());
-                        break;
-                    }
-                }
-            }
-            let device = device.context("no Wi-Fi hardware device was found")?;
-            if device.is_empty()
-                || device.len() > 32
-                || !device
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-            {
-                bail!("Wi-Fi hardware device name is invalid");
-            }
-            let result = Command::new("/usr/sbin/networksetup")
-                .args(["-setairportnetwork", device.as_str(), ssid])
-                .output()
-                .context("ask macOS to join the requested Wi-Fi network")?;
-            if !result.status.success() {
-                bail!("networksetup failed with status {}", result.status);
+            let password = login_wifi_password(console_uid()?, ssid)?;
+            let Some(password) = password else {
+                bail!(
+                    "macOS did not join {ssid}, and login keychain has no scriptd-mwifi:{ssid} credential"
+                );
+            };
+            let _ = attempt_wifi_join(&device, ssid, Some(&password));
+            if !wait_for_wifi(&device, ssid) {
+                bail!("macOS did not associate with {ssid} after the saved credential was used");
             }
             Ok(())
         }
@@ -1411,6 +1391,170 @@ fn execute(operation: &Operation, grants: &[InstallerGrant]) -> Result<()> {
             package_path,
         } => installer::install_approved_package(package_identifier, package_path, grants),
     }
+}
+
+fn wifi_device() -> Result<String> {
+    let ports = Command::new("/usr/sbin/networksetup")
+        .arg("-listallhardwareports")
+        .output()
+        .context("read Wi-Fi hardware device")?;
+    if !ports.status.success() {
+        bail!("networksetup could not enumerate hardware ports");
+    }
+    parse_wifi_device(&String::from_utf8_lossy(&ports.stdout))
+}
+
+fn parse_wifi_device(output: &str) -> Result<String> {
+    let mut in_wifi = false;
+    for line in output.lines() {
+        if let Some(value) = line.trim().strip_prefix("Hardware Port:") {
+            in_wifi = matches!(value.trim(), "Wi-Fi" | "AirPort");
+        } else if in_wifi {
+            if let Some(value) = line.trim().strip_prefix("Device:") {
+                let device = value.trim();
+                if !device.is_empty()
+                    && device.len() <= 32
+                    && device.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                {
+                    return Ok(device.to_string());
+                }
+                bail!("Wi-Fi hardware device name is invalid");
+            }
+        }
+    }
+    bail!("no Wi-Fi hardware device was found")
+}
+
+fn attempt_wifi_join(device: &str, ssid: &str, password: Option<&str>) -> Result<bool> {
+    let mut command = Command::new("/usr/sbin/networksetup");
+    command.args(["-setairportnetwork", device, ssid]);
+    if password.is_some() {
+        command.arg("-");
+        command.stdin(std::process::Stdio::piped());
+    }
+    let mut child = command
+        .spawn()
+        .context("ask macOS to join the requested Wi-Fi network")?;
+    if let Some(password) = password {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("open networksetup credential input")?;
+        stdin
+            .write_all(password.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .context("send the saved Wi-Fi credential")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("wait for the Wi-Fi join command")?;
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output.status.success()
+        && !message
+            .to_ascii_lowercase()
+            .contains("failed to join network"))
+}
+
+fn wait_for_wifi(device: &str, ssid: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if current_wifi_ssid(device).ok().flatten().as_deref() == Some(ssid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn current_wifi_ssid(device: &str) -> Result<Option<String>> {
+    let output = Command::new("/usr/sbin/ipconfig")
+        .args(["getsummary", device])
+        .output()
+        .context("read the active Wi-Fi network")?;
+    if !output.status.success() {
+        bail!("ipconfig could not read the active Wi-Fi network");
+    }
+    Ok(parse_ipconfig_ssid(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_ipconfig_ssid(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("  SSID : ")
+            .map(str::trim)
+            .filter(|ssid| !ssid.is_empty() && *ssid != "<redacted>")
+            .map(str::to_string)
+    })
+}
+
+fn wifi_keychain_service(ssid: &str) -> String {
+    format!("scriptd-mwifi:{ssid}")
+}
+
+fn login_wifi_password(uid: u32, ssid: &str) -> Result<Option<String>> {
+    let keychain = login_keychain_path(uid)?;
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            &wifi_keychain_service(ssid),
+            "-a",
+            ssid,
+            "-w",
+        ])
+        .arg(&keychain)
+        .output()
+        .context("read the app user's Wi-Fi credential")?;
+    if !output.status.success() {
+        if output.status.code() == Some(44) {
+            return Ok(None);
+        }
+        bail!("login keychain could not read the saved Wi-Fi credential");
+    }
+    let password = String::from_utf8(output.stdout)
+        .context("saved Wi-Fi credential is not UTF-8")?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    Ok((!password.is_empty()).then_some(password))
+}
+
+fn login_keychain_path(uid: u32) -> Result<PathBuf> {
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut password_entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            password_entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        bail!("could not resolve the app user's home directory");
+    }
+    let password_entry = unsafe { password_entry.assume_init() };
+    if password_entry.pw_dir.is_null() {
+        bail!("the app user has no home directory");
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr(password_entry.pw_dir) };
+    let keychain =
+        PathBuf::from(home.to_string_lossy().as_ref()).join("Library/Keychains/login.keychain-db");
+    let metadata = fs::metadata(&keychain).context("inspect the app user's login keychain")?;
+    if !metadata.is_file() || metadata.uid() != uid {
+        bail!("the app user's login keychain has an unexpected owner");
+    }
+    Ok(keychain)
 }
 
 fn configure_accepted_stream(stream: &UnixStream) -> Result<()> {
@@ -1524,7 +1668,7 @@ fn read_request(
         if uid != 0 {
             bail!("administrator approval requires a root-owned bridge client");
         }
-        let client_identity = authenticate_peer_token(pid, audit_token)?;
+        let client_identity = authenticate_peer_token(pid, audit_token, None)?;
         let bridge_identity = authenticate_peer_identity_path(&std::env::current_exe()?)?;
         if client_identity != bridge_identity {
             bail!("administrator approval must come from the installed bridge executable");
@@ -1535,7 +1679,11 @@ fn read_request(
         bail!("bridge peer user was not accepted");
     }
     let identity = if operation_requires_peer_identity(request.op.as_str()) {
-        Some(authenticate_peer_token(pid, audit_token)?)
+        Some(authenticate_peer_token(
+            pid,
+            audit_token,
+            ACTIVE_PROFILE.get().copied(),
+        )?)
     } else {
         None
     };
@@ -1642,10 +1790,14 @@ fn peer_audit_token(stream: &UnixStream) -> Result<Option<AuditToken>> {
 
 #[cfg(test)]
 fn authenticate_peer(pid: u32) -> Result<Identity> {
-    authenticate_peer_token(pid, None)
+    authenticate_peer_token(pid, None, None)
 }
 
-fn authenticate_peer_token(pid: u32, audit_token: Option<AuditToken>) -> Result<Identity> {
+fn authenticate_peer_token(
+    pid: u32,
+    audit_token: Option<AuditToken>,
+    embedded_profile: Option<HelperProfile>,
+) -> Result<Identity> {
     const PROC_PIDPATHINFO_MAXSIZE: u32 = 4096;
     extern "C" {
         fn proc_pidpath(
@@ -1727,19 +1879,50 @@ fn authenticate_peer_token(pid: u32, audit_token: Option<AuditToken>) -> Result<
         bail!("ad-hoc signed apps cannot pair with the bridge");
     }
     let requirement = developer_id_requirement(&team, &identifier)?;
-    let verify_distribution = Command::new("/usr/bin/codesign")
-        .args([
-            "--verify",
-            "--strict",
-            "--all-architectures",
-            "-R",
-            &requirement,
-            "--",
-        ])
-        .arg(&process_reference)
-        .output()
+    let verify_distribution = codesign_requirement(&requirement, &process_reference)
         .context("verify bridge peer Developer ID distribution identity")?;
-    if !verify_distribution.status.success() {
+    let local_app = accepts_local_development_identity(
+        embedded_profile,
+        &Identity {
+            team_identifier: team.clone(),
+            bundle_identifier: identifier.clone(),
+        },
+    ) && executable.ancestors().any(|path| {
+        path.extension().is_some_and(|extension| extension == "app") && path.starts_with("/Users/")
+    });
+    let verify_local_development = if local_app && !verify_distribution {
+        let requirement = local_development_requirement(&team, &identifier)?;
+        // Custom requirement syntax is unsupported for a PID diskrep. Re-check
+        // the exact kernel-reported executable path under the same strict
+        // signature and CDHash bound before accepting its certificate.
+        let path_identity = authenticate_peer_identity_path(&executable)?;
+        if path_identity.team_identifier != team || path_identity.bundle_identifier != identifier {
+            bail!("bridge peer executable changed during local identity verification");
+        }
+        let path_details = Command::new("/usr/bin/codesign")
+            .args(["-dv", "--verbose=4", "--"])
+            .arg(&executable)
+            .output()
+            .context("read local bridge peer code-directory hash")?;
+        if !path_details.status.success() {
+            bail!("bridge peer executable signature is unavailable");
+        }
+        let path_cdhash = String::from_utf8_lossy(&path_details.stderr)
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("CDHash=")
+                    .map(|value| value.trim().to_ascii_lowercase())
+            })
+            .context("bridge peer executable has no code-directory hash")?;
+        if path_cdhash != cdhash {
+            bail!("bridge peer executable changed during local identity verification");
+        }
+        codesign_requirement(&requirement, executable.to_string_lossy().as_ref())
+            .context("verify local embedded app development identity")?
+    } else {
+        false
+    };
+    if !verify_distribution && !verify_local_development {
         bail!("bridge peer must be signed for Developer ID distribution");
     }
     Ok(Identity {
@@ -1748,6 +1931,11 @@ fn authenticate_peer_token(pid: u32, audit_token: Option<AuditToken>) -> Result<
     })
 }
 
+/// Returns the kernel-bound peer identifier, team, and code-directory hash.
+///
+/// Apple Development signing exposes the team as `teamid` in the static
+/// signing dictionary; distribution builds use `kSecCodeInfoTeamIdentifier`. Both
+/// are kernel-bound values read from the authenticated peer code reference.
 fn security_identity_for_process(
     pid: u32,
     audit_token: Option<AuditToken>,
@@ -1822,8 +2010,17 @@ fn security_identity_for_process(
                 "bridge peer signing information is missing {label}"
             ))
     };
-    let team = string_value(unsafe { kSecCodeInfoTeamIdentifier }, "the team identifier")?;
     let identifier = string_value(unsafe { kSecCodeInfoIdentifier }, "the identifier")?;
+    // Apple Development signing exposes the team as `teamid` in the static
+    // signing dictionary. Prefer that kernel-bound value and fall back to
+    // the documented kSecCodeInfoTeamIdentifier key for distribution builds.
+    let team = information
+        .get(&CFString::from_str("teamid"))
+        .or_else(|| information.get(unsafe { kSecCodeInfoTeamIdentifier }))
+        .and_then(|value| value.downcast::<CFString>().ok())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty())
+        .context("bridge peer signing information is missing the team identifier")?;
     let cdhash = information
         .get(unsafe { kSecCodeInfoUnique })
         .and_then(|value| value.downcast::<CFData>().ok())
@@ -1831,7 +2028,52 @@ fn security_identity_for_process(
     Ok((identifier, team, hex::encode(cdhash.to_vec())))
 }
 
+/// Apple Development is accepted only for an embedded helper's own local app.
+/// Released direct apps keep the Developer ID check.
+fn local_development_requirement(team: &str, identifier: &str) -> Result<String> {
+    validate_requirement_values(team, identifier)?;
+    Ok(format!(
+        "=anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.2] exists and certificate leaf[field.1.2.840.113635.100.6.1.12] exists and certificate leaf[subject.OU] = {} and identifier {}",
+        quote_requirement_value(team),
+        quote_requirement_value(identifier)
+    ))
+}
+
 fn developer_id_requirement(team: &str, identifier: &str) -> Result<String> {
+    validate_requirement_values(team, identifier)?;
+    // codesign -R treats a bare argument as a file path; '=' marks source text.
+    Ok(format!(
+        "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = {} and identifier {}",
+        quote_requirement_value(team),
+        quote_requirement_value(identifier)
+    ))
+}
+
+fn accepts_local_development_identity(profile: Option<HelperProfile>, identity: &Identity) -> bool {
+    profile.is_some_and(|profile| profile.accepts_bundle(&identity.bundle_identifier))
+        && identity.team_identifier == EXPECTED_TEAM_IDENTIFIER
+}
+
+fn codesign_requirement(requirement: &str, process_reference: &str) -> Result<bool> {
+    let output = Command::new("/usr/bin/codesign")
+        .args([
+            "--verify",
+            "--strict",
+            "--all-architectures",
+            "-R",
+            requirement,
+            "--",
+        ])
+        .arg(process_reference)
+        .output()?;
+    Ok(output.status.success())
+}
+
+fn quote_requirement_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn validate_requirement_values(team: &str, identifier: &str) -> Result<()> {
     if team.is_empty()
         || !team.bytes().all(|byte| byte.is_ascii_alphanumeric())
         || identifier.is_empty()
@@ -1839,14 +2081,7 @@ fn developer_id_requirement(team: &str, identifier: &str) -> Result<String> {
     {
         bail!("bridge peer signing identity contains invalid requirement values");
     }
-    let quote_requirement_value =
-        |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""));
-    // codesign -R treats a bare argument as a file path; '=' marks source text.
-    Ok(format!(
-        "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = {} and identifier {}",
-        quote_requirement_value(team),
-        quote_requirement_value(identifier)
-    ))
+    Ok(())
 }
 
 fn process_code_reference(pid: u32) -> String {
@@ -2377,6 +2612,23 @@ mod tests {
                 ssid: "Saved network".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn wifi_join_uses_ipconfig_and_the_login_keychain_only() {
+        assert_eq!(
+            parse_wifi_device(
+                "Hardware Port: Ethernet\nDevice: en1\n\nHardware Port: Wi-Fi\nDevice: en0\n"
+            )
+            .unwrap(),
+            "en0"
+        );
+        assert_eq!(
+            parse_ipconfig_ssid("  LinkStatusActive : TRUE\n  SSID : Home\n"),
+            Some("Home".to_string())
+        );
+        assert_eq!(parse_ipconfig_ssid("  SSID : <redacted>\n"), None);
+        assert_eq!(wifi_keychain_service("Home"), "scriptd-mwifi:Home");
     }
 
     fn smoke_request(
@@ -3762,6 +4014,51 @@ mod tests {
     #[test]
     fn code_signature_queries_bind_to_the_running_peer_pid() {
         assert_eq!(process_code_reference(42), "+42");
+    }
+
+    #[test]
+    fn local_helper_development_identity_is_distinct_from_developer_id() {
+        let requirement =
+            local_development_requirement("TEAM123456", DIRECT_APP_BUNDLE_IDENTIFIER).unwrap();
+        assert!(requirement.contains("field.1.2.840.113635.100.6.1.2"));
+        assert!(requirement.contains("field.1.2.840.113635.100.6.1.12"));
+        assert!(requirement.contains(r#"certificate leaf[subject.OU] = "TEAM123456""#));
+        assert!(!requirement.contains("100.6.1.13"));
+        assert!(!requirement.contains("100.6.2.6"));
+        assert!(local_development_requirement("bad-team!", DIRECT_APP_BUNDLE_IDENTIFIER).is_err());
+    }
+
+    #[test]
+    fn local_helper_development_fallback_is_limited_to_its_owning_app() {
+        let owning_app = Identity {
+            team_identifier: EXPECTED_TEAM_IDENTIFIER.into(),
+            bundle_identifier: DIRECT_APP_BUNDLE_IDENTIFIER.into(),
+        };
+        assert!(accepts_local_development_identity(
+            Some(HelperProfile::AllInOne),
+            &owning_app
+        ));
+        assert!(!accepts_local_development_identity(None, &owning_app));
+        let module_app = Identity {
+            team_identifier: EXPECTED_TEAM_IDENTIFIER.into(),
+            bundle_identifier: "com.astronlab.macmodules.mwifi".into(),
+        };
+        assert!(accepts_local_development_identity(
+            Some(HelperProfile::Wifi),
+            &module_app
+        ));
+        assert!(!accepts_local_development_identity(
+            Some(HelperProfile::AllInOne),
+            &module_app
+        ));
+        let other_team = Identity {
+            team_identifier: "OTHERTEAM1".into(),
+            bundle_identifier: DIRECT_APP_BUNDLE_IDENTIFIER.into(),
+        };
+        assert!(!accepts_local_development_identity(
+            Some(HelperProfile::AllInOne),
+            &other_team
+        ));
     }
 
     #[test]
